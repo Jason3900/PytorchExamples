@@ -8,7 +8,7 @@ We provide a simple pytorch-based bert classification example with well-formed s
 conda create -n torch_env python=3.9 pandas tqdm scikit-learn -y
 conda activate torch_env
 conda install pytorch cudatoolkit=11.3.1 -y
-pip install transformers
+pip install transformers wandb
 ```
 
 ## Train
