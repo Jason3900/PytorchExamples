@@ -20,8 +20,11 @@ pip install transformers wandb
 3. Create labelspace file containing all labels, sep by line break
 4. Edit scripts/train.sh
 5. (optional) --use_wandb and set wandb_key to enable logging with wandb.ai
-6. Run it!
+6. Activate conda env and Run it! 
 
-```bash
-bash scripts/train.sh
-```
+    ```bash
+    bash scripts/train.sh
+    ```
+
+## Debug
+[Fairseq](https://github.com/facebookresearch/fairseq) wraps a multiprocessing-supported pdb. You can use `from debugger.mp_pdb import pdb;pdb.set_trace` in our code to debug in real time. See common usage at https://docs.python.org/3/library/pdb.html
