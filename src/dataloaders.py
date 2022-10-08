@@ -1,6 +1,6 @@
 # -*- coding:UTF-8 -*-
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 
 class BatchCollate:
@@ -45,12 +45,33 @@ class BatchCollate:
         return batch_dict
 
 
-def init_dataloader(dataset, batch_size: int, input_pad_id: int, shuffle: bool):
+def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, is_distributed=False):
     collate_fn = BatchCollate(input_pad_id=input_pad_id)
+    sampler = init_sampler(dataset=dataset,
+                           shuffle=shuffle,
+                           is_distributed=is_distributed)
+    if is_distributed:
+        # sampler option is mutually exclusive with shuffle
+        shuffle = None
+
     data_loader = DataLoader(
         dataset=dataset,
+        sampler=sampler,
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn
     )
     return data_loader
+
+
+def init_sampler(dataset, shuffle: bool, is_distributed: bool):
+    if is_distributed:
+        import horovod.torch as hvd
+        sampler = DistributedSampler(dataset=dataset,
+                                     shuffle=shuffle,
+                                     num_replicas=hvd.size(),
+                                     rank=hvd.rank(),
+                                     drop_last=True)
+    else:
+        sampler = None
+    return sampler
