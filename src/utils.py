@@ -1,6 +1,7 @@
 # -*- coding:UTF-8 -*-
 import torch
 import horovod.torch as hvd
+import logging
 
 def init_distributed():
     hvd.init()
@@ -20,4 +21,10 @@ def broadcast_model_params(model, optimizer):
 def get_world_size():
     return torch.distributed.get_world_size()
 
+class LogMessage:
+    def __init__(self, is_distributed):
+        self.is_distributed = is_distributed
 
+    def __call__(self, message):
+        if (self.is_distributed and hvd.rank() == 0) or not self.is_distributed:
+            logging.info(message)

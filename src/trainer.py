@@ -2,14 +2,13 @@
 from src.dataloaders import init_dataloader
 from src.datasets import SNLIDataset, IMDBDataset, LabelMap
 from src.model import BertCLSModel
-from src.utils import init_distributed, pin_gpu_to_process, wrap_hvd_optimizer, broadcast_model_params
+from src.utils import init_distributed, pin_gpu_to_process, wrap_hvd_optimizer, broadcast_model_params, LogMessage
 import horovod.torch as hvd
 import torch
 from transformers import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
-from datetime import datetime
 import os
 import random
 import wandb
@@ -22,7 +21,8 @@ class Trainer:
         self.fix_seed(args.seed)
         self.device = None
         self.is_distributed = False
-        self.setup_device(use_horovod=args.horovod)
+        self.setup_device(use_horovod=args.horovod)  # also setup is_distributed and device attr
+        self.log_info_message = LogMessage(self.is_distributed)
         self.label_map = LabelMap(args.label_path)
         self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
         self.model = BertCLSModel(pretrained_path=args.pretrained,
@@ -38,6 +38,7 @@ class Trainer:
         self.train_loader, self.valid_loader = self.prepare_data(train_path=args.train_path,
                                                                  valid_path=args.valid_path,
                                                                  pre_tokenized=args.pre_tokenized,
+                                                                 num_workers=args.num_data_workers,
                                                                  save_cache=args.save_cache,
                                                                  use_cache=args.use_cache)
 
@@ -77,7 +78,13 @@ class Trainer:
         torch.backends.cudnn.deterministic = True
         random.seed(seed)
 
-    def prepare_data(self, train_path: str, valid_path: str, pre_tokenized: bool, save_cache: bool, use_cache: bool):
+    def prepare_data(self,
+                     train_path: str,
+                     valid_path: str,
+                     pre_tokenized: bool,
+                     num_workers: int,
+                     save_cache: bool,
+                     use_cache: bool):
         train_set = IMDBDataset(data_type="train", path=train_path, label_map=self.label_map,
                                 tokenizer=self.tokenizer, pre_tokenize=pre_tokenized,
                                 max_seq_len=self.max_seq_len, save_cache=save_cache, use_cache=use_cache)
@@ -86,6 +93,7 @@ class Trainer:
                                        shuffle=True,
                                        batch_size=self.batch_size,
                                        input_pad_id=self.tokenizer.pad_token_id,
+                                       num_workers=num_workers,
                                        is_distributed=self.is_distributed
                                        )
         valid_loader = None
@@ -95,9 +103,12 @@ class Trainer:
                                     max_seq_len=self.max_seq_len, save_cache=save_cache, use_cache=use_cache)
 
             valid_loader = init_dataloader(dataset=valid_set,
+                                           shuffle=False,
                                            batch_size=self.batch_size,
                                            input_pad_id=self.tokenizer.pad_token_id,
-                                           shuffle=False)
+                                           num_workers=0,  # disable multiprocessing on valid set data loading
+                                           is_distributed=False
+                                           )
         return train_loader, valid_loader
 
     def init_optimizer(self):
@@ -116,11 +127,11 @@ class Trainer:
         if self.is_distributed and self.scale_lr:
             world_size = hvd.size()
             self.lr *= world_size
-            logging.info(f"scale lr to {self.lr} with hvd_size: {world_size}")
+            self.log_info_message(f"scale lr to {self.lr} with hvd_size: {world_size}")
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.lr)
         if self.is_distributed:
             optimizer = wrap_hvd_optimizer(optimizer, self.model.named_parameters())
-            logging.info("wrap optimizer with horovod")
+            self.log_info_message("wrap optimizer with horovod")
         return optimizer
 
     def init_scheduler(self):
@@ -130,7 +141,7 @@ class Trainer:
             num_warmup_steps=total_train_steps * 0.1,
             num_training_steps=total_train_steps,
         )
-        logging.info("setup lr_scheduler")
+        self.log_info_message("setup lr_scheduler")
         return lr_scheduler
 
     def eval(self):
@@ -165,12 +176,19 @@ class Trainer:
     def train(self):
         if self.is_distributed:
             broadcast_model_params(model=self.model, optimizer=self.optimizer)
-            logging.info("broadcast model params")
+            logging.info(f"broadcast model params to rank {hvd.rank()}")
         current_step = 0
         no_improve = 0
+        
         for epoch in range(self.max_epochs):
             num_steps_one_epoch = len(self.train_loader)
             pbar = tqdm(total=num_steps_one_epoch)
+            # In distributed mode, calling the set_epoch() method at the beginning of each epoch 
+            # before creating the DataLoader iterator is necessary
+            # to make shuffling work properly across multiple epochs.
+            # Otherwise, the same ordering will be always used.
+            if self.is_distributed:
+                self.train_loader.sampler.set_epoch(epoch)
             self.model.train()
             for batch in self.train_loader:
                 if torch.cuda.is_available():
@@ -186,13 +204,11 @@ class Trainer:
                 if current_step % self.log_interval == 0 or current_step % num_steps_one_epoch == 0:
                     if self.use_wandb:
                         wandb.log({"loss": loss, "lr": current_lr})
-                    logging.info(f"step {current_step}, current loss: {loss}, current_lr: {current_lr}")
-                    if self.is_distributed:
-                        if hvd.rank() == 0:
-                            pbar.update(self.log_interval)
-                    else:
+
+                    if (self.is_distributed and hvd.rank() == 0) or not self.is_distributed:
+                        logging.info(f"step {current_step}, current loss: {loss}, current_lr: {current_lr}")
                         pbar.update(self.log_interval)
-                
+
             pbar.close()
 
             self.model.eval()
@@ -212,8 +228,10 @@ class Trainer:
             else:
                 no_improve += 1
                 if no_improve >= self.patience:
-                    logging.info(f"no improve within {no_improve} epochs, early stop")
+
+                    self.log_info_message(f"no improve within {no_improve} epochs, early stop")
                     break
 
-            logging.info(f"epoch {epoch} finished. valid acc: {valid_acc}, valid loss: {valid_loss}")
-            logging.info(f"current best acc {self.best_metric}, in epoch {self.best_epoch}")
+            self.log_info_message(f"epoch {epoch} finished. \
+                            valid acc: {valid_acc}, valid loss: {valid_loss}")
+            self.log_info_message(f"current best acc {self.best_metric}, in epoch {self.best_epoch}")

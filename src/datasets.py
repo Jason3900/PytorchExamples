@@ -6,6 +6,8 @@ import os
 import json
 import logging
 import random
+import numpy as np
+import pyarrow as pa
 import pandas as pd
 from tqdm import tqdm
 
@@ -68,6 +70,18 @@ class SeqCLSDataset(Dataset):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def py2zero_copy_objs(data_i):
+        for k, v in data_i.items():
+            if k == "uuid":
+                value = pa.scaler(v)
+            elif k == "label":
+                value = np.int32(v)
+            else:
+                value = np.array(v, dtype=np.int32)
+            data_i[k] = value
+        return data_i
+
     def gather_data(self, path):
         pkl_path = path+".pkl"
         if self.use_cache and os.path.exists(pkl_path):
@@ -94,8 +108,12 @@ class SeqCLSDataset(Dataset):
                     logging.warning(f"{path}, {idx} process error, continue")
                     continue
                 self.num_samples += 1
-
-                data.append({"uuid": uuid, **inputs, "label": label_id})
+                data_i = {"uuid": uuid, **inputs, "label": label_id}
+                # convert to numpy or pyarrow objects to avoid copy-on-write behavior
+                # when use multiprocessing data loading strategy
+                # see more details on https://github.com/pytorch/pytorch/issues/13246#issuecomment-905703662
+                data_i = self.py2zero_copy_objs(data_i)
+                data.append(data_i)
             logging.info(f"num samples: {self.num_samples}, max len in dataset: {max_len_in_data}")
         if self.save_cache and not os.path.exists(pkl_path):
             with open(pkl_path, "wb") as fw:

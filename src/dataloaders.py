@@ -37,6 +37,10 @@ class BatchCollate:
         batch_dict = dict()
         for key in keys:
             if key != "uuid":
+                # pytorch: It is generally not recommended to return CUDA tensors in multi-process loading
+                # because of many subtleties in using CUDA and sharing CUDA tensors in multiprocessing
+                # Instead, we recommend using automatic memory pinning (i.e., setting pin_memory=True),
+                # which enables fast data transfer to CUDA-enabled GPUs.
                 value = torch.tensor(
                     [item[key] for item in batch], dtype=torch.long)
             else:
@@ -45,7 +49,7 @@ class BatchCollate:
         return batch_dict
 
 
-def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, is_distributed=False):
+def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, num_workers=0, is_distributed=False):
     collate_fn = BatchCollate(input_pad_id=input_pad_id)
     sampler = init_sampler(dataset=dataset,
                            shuffle=shuffle,
@@ -59,6 +63,8 @@ def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, 
         sampler=sampler,
         batch_size=batch_size,
         shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,  # set pin memory to True to enable faster data transfer
         collate_fn=collate_fn
     )
     return data_loader

@@ -34,6 +34,7 @@ def get_train_args(parser):
     parser.add_argument("--horovod", action="store_true", help="use horovod for distributed training")
     parser.add_argument("--train-path", type=str, required=True)
     parser.add_argument("--valid-path", type=str)
+    parser.add_argument("--num-data-workers", type=int, default=0, help="use N workers to load data with multiprocessing")
     parser.add_argument("--ckpt-path", type=str, required=True, help="dir to save ckpts")
     parser.add_argument("--max-epochs", type=int, required=True, help="max epoches to train")
     parser.add_argument("--patience", type=int, required=True, help="if no improve counts exceeds patience, trigger early stop")
