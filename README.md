@@ -17,7 +17,7 @@ We provide a simple pytorch-based bert classification example with well-formed s
    conda activate torch_env
    # install pytorch via pip instead of conda is a simpler way to use horovod. But you have to make sure g++-5 or above is installed.
    pip install torch --extra-index-url https://download.pytorch.org/whl/cu113
-   pip install transformers wandb
+   pip install transformers wandb pyarrow filelock
    ```
 
 3. install horovod with GPU support, see [horovod on GPU](https://horovod.readthedocs.io/en/stable/gpus_include.html) for more instructions.
