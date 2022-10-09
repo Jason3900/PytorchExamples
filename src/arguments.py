@@ -32,6 +32,8 @@ def get_common_args(parser):
 
 def get_train_args(parser):
     parser.add_argument("--horovod", action="store_true", help="use horovod for distributed training")
+    parser.add_argument("--amp", action="store_true", help="use Automatic Mixed Precision")
+    parser.add_argument("--adasum", action="store_true", help="use adasum algorithm when distributed, note that this is against no-scale-lr")
     parser.add_argument("--train-path", type=str, required=True)
     parser.add_argument("--valid-path", type=str)
     parser.add_argument("--num-data-workers", type=int, default=0, help="use N workers to load data with multiprocessing")

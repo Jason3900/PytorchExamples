@@ -74,7 +74,7 @@ class SeqCLSDataset(Dataset):
     def py2zero_copy_objs(data_i):
         for k, v in data_i.items():
             if k == "uuid":
-                value = pa.scaler(v)
+                value = pa.scalar(v)
             elif k == "label":
                 value = np.int32(v)
             else:
@@ -115,9 +115,13 @@ class SeqCLSDataset(Dataset):
                 data_i = self.py2zero_copy_objs(data_i)
                 data.append(data_i)
             logging.info(f"num samples: {self.num_samples}, max len in dataset: {max_len_in_data}")
-        if self.save_cache and not os.path.exists(pkl_path):
-            with open(pkl_path, "wb") as fw:
-                fw.write(pkl.dumps(data))
+        if self.save_cache:
+            if not os.path.exists(pkl_path):
+                with FileLock(os.path.expanduser("~/.horovod_lock")):
+                    with open(pkl_path, "wb") as fw:
+                        fw.write(pkl.dumps(data))
+            else:
+                logging.info("try to save dataset but pkl exists! ignore...")
         return data
 
 

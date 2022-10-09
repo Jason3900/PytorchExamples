@@ -2,17 +2,20 @@
 from src.dataloaders import init_dataloader
 from src.datasets import SNLIDataset, IMDBDataset, LabelMap
 from src.model import BertCLSModel
-from src.utils import init_distributed, pin_gpu_to_process, wrap_hvd_optimizer, broadcast_model_params, LogMessage
+from src.utils import \
+    init_distributed, pin_gpu_to_process, wrap_hvd_optimizer, get_world_size, \
+    broadcast_model_params, setup_gradient_scaler, metric_average, LogMessage
 import horovod.torch as hvd
 import torch
 from transformers import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
-from sklearn.metrics import accuracy_score
+from filelock import FileLock
 from tqdm import tqdm
 import os
 import random
 import wandb
 import logging
+
 
 
 class Trainer:
@@ -21,6 +24,9 @@ class Trainer:
         self.fix_seed(args.seed)
         self.device = None
         self.is_distributed = False
+        self.use_amp = args.amp
+        self.use_adasum = args.adasum
+        assert not (self.use_amp and self.use_adasum), "amp and adasum cannot be used together"
         self.setup_device(use_horovod=args.horovod)  # also setup is_distributed and device attr
         self.log_info_message = LogMessage(self.is_distributed)
         self.label_map = LabelMap(args.label_path)
@@ -43,8 +49,9 @@ class Trainer:
                                                                  use_cache=args.use_cache)
 
         self.ckpt_path = os.path.join(args.ckpt_path, self.timestamp)
-        if not os.path.exists(self.ckpt_path):
-            os.makedirs(self.ckpt_path)
+        with FileLock(os.path.expanduser("~/.horovod_lock")):
+            if not os.path.exists(self.ckpt_path):
+                os.makedirs(self.ckpt_path)
         self.max_epochs = args.max_epochs
         self.patience = args.patience
         self.log_interval = args.log_interval
@@ -107,7 +114,7 @@ class Trainer:
                                            batch_size=self.batch_size,
                                            input_pad_id=self.tokenizer.pad_token_id,
                                            num_workers=0,  # disable multiprocessing on valid set data loading
-                                           is_distributed=False
+                                           is_distributed=self.is_distributed
                                            )
         return train_loader, valid_loader
 
@@ -124,13 +131,20 @@ class Trainer:
             },
         ]
         # effective batch size is scaled by the num of hvd process
-        if self.is_distributed and self.scale_lr:
-            world_size = hvd.size()
-            self.lr *= world_size
-            self.log_info_message(f"scale lr to {self.lr} with hvd_size: {world_size}")
+        if self.is_distributed:
+            # If using GPU Adasum allreduce, scale learning rate by local_size.
+            if self.use_adasum:
+                scale_factor = hvd.local_size()
+            elif self.scale_lr:
+                scale_factor = get_world_size()
+            else:
+                scale_factor = 1
+
+            self.lr *= scale_factor
+            self.log_info_message(f"scale lr to {self.lr} with scale factor: {scale_factor}")
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.lr)
         if self.is_distributed:
-            optimizer = wrap_hvd_optimizer(optimizer, self.model.named_parameters())
+            optimizer = wrap_hvd_optimizer(optimizer, self.model.named_parameters(), self.use_adasum)
             self.log_info_message("wrap optimizer with horovod")
         return optimizer
 
@@ -147,20 +161,27 @@ class Trainer:
     def eval(self):
         total_preds = []
         total_golds = []
-        total_loss = 0
+        acc = 0.
+        total_loss = 0.
         with torch.no_grad():
             for batch in self.valid_loader:
                 if torch.cuda.is_available():
                     self.batch2cuda(batch, ignore_keys=["uuid"])
                 loss, logits = self.model(batch)
-                batch_golds = batch["label"].cpu().tolist()
-                batch_preds = torch.argmax(logits.detach().cpu(), dim=-1).tolist()
-                total_golds.extend(batch_golds)
-                total_preds.extend(batch_preds)
-                total_loss += loss
-        acc = accuracy_score(y_true=total_golds, y_pred=total_preds)
-        epoch_loss = total_loss / len(self.valid_loader)
-        return acc, epoch_loss
+                batch_golds = batch["label"].cpu()
+                batch_preds = torch.argmax(logits.cpu(), dim=-1)
+                acc += batch_preds.eq(batch_golds).float().sum()
+                total_golds.extend(batch_golds.tolist())
+                total_preds.extend(batch_preds.tolist())
+                total_loss += loss.item()
+        # use sampler to determine the number of examples in this worker's partition.
+        acc /= len(self.valid_loader.sampler)
+        total_loss /= len(self.valid_loader.sampler)
+        # use allreduce to get average metrics
+        if self.is_distributed:
+            total_loss = metric_average(total_loss, 'avg_loss')
+            acc = metric_average(acc, 'avg_accuracy')
+        return acc, total_loss
 
     @staticmethod
     def batch2cuda(batch, ignore_keys=["uuid"]):
@@ -177,9 +198,11 @@ class Trainer:
         if self.is_distributed:
             broadcast_model_params(model=self.model, optimizer=self.optimizer)
             logging.info(f"broadcast model params to rank {hvd.rank()}")
+        if self.use_amp:
+            grad_scaler = setup_gradient_scaler()
+
         current_step = 0
         no_improve = 0
-        
         for epoch in range(self.max_epochs):
             num_steps_one_epoch = len(self.train_loader)
             pbar = tqdm(total=num_steps_one_epoch)
@@ -194,29 +217,58 @@ class Trainer:
                 if torch.cuda.is_available():
                     self.batch2cuda(batch, ignore_keys=["uuid"])
                 self.optimizer.zero_grad()
-                loss, logits = self.model(batch)
-                loss.backward()
-                self.optimizer.step()
+                if self.use_amp:
+                    with torch.cuda.amp.autocast():
+                        loss, logits = self.model(batch)
+                else:
+                    loss, logits = self.model(batch)
+                # Each parameter’s gradient (.grad attribute) should be unscaled
+                # before the optimizer updates the parameters,
+                # so the scale factor does not interfere with the learning rate.
+                if self.use_amp:
+                    grad_scaler.scale(loss).backward()
+                    if self.is_distributed:
+                        self.optimizer.synchronize()
+                    # In-place unscaling of all gradients before weights update
+                    grad_scaler.unscale_(self.optimizer)
+                    if self.is_distributed:
+                        with self.optimizer.skip_synchronize():
+                            grad_scaler.step(self.optimizer)
+                    else:
+                        grad_scaler.step(self.optimizer)
+                    # Update scaler in case of overflow/underflow
+                    grad_scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
                 self.lr_scheduler.step()
                 current_step += 1
                 loss = loss.detach().item()
                 current_lr = self.lr_scheduler.get_last_lr()[0]
                 if current_step % self.log_interval == 0 or current_step % num_steps_one_epoch == 0:
+
+                    update_steps = self.log_interval
+                    if current_step % num_steps_one_epoch == 0:
+                        update_steps = current_step % self.log_interval
+                        if update_steps == 0:
+                            update_steps = self.log_interval
+
                     if self.use_wandb:
                         wandb.log({"loss": loss, "lr": current_lr})
 
                     if (self.is_distributed and hvd.rank() == 0) or not self.is_distributed:
                         logging.info(f"step {current_step}, current loss: {loss}, current_lr: {current_lr}")
-                        pbar.update(self.log_interval)
+                        pbar.update(update_steps)
 
             pbar.close()
-
+            self.log_info_message(f"epoch {epoch} training finished.")
             self.model.eval()
             valid_acc, valid_loss = self.eval()
             if self.use_wandb:
                 wandb.log({"valid_loss": loss, "valid_acc": valid_acc})
             if self.best_metric < valid_acc:
                 self.best_metric = valid_acc
+                self.best_epoch = epoch
 
                 # save ckpt on rank 0 only
                 if self.is_distributed and hvd.rank() != 0:

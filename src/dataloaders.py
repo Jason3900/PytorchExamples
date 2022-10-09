@@ -1,6 +1,8 @@
 # -*- coding:UTF-8 -*-
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+import numpy as np
+import torch.multiprocessing as mp
 
 
 class BatchCollate:
@@ -9,8 +11,8 @@ class BatchCollate:
 
     def pad_to_max_len(self, input_seq, max_len, pad_value=0):
         pad_len = max_len - len(input_seq)
-        pad_piece = [pad_value for _ in range(pad_len)]
-        return input_seq + pad_piece
+        pad_piece = np.full(shape=(pad_len,), fill_value=pad_value)
+        return np.concatenate([input_seq, pad_piece])
 
     def pad_instance(self, instance, max_len):
         """
@@ -42,7 +44,7 @@ class BatchCollate:
                 # Instead, we recommend using automatic memory pinning (i.e., setting pin_memory=True),
                 # which enables fast data transfer to CUDA-enabled GPUs.
                 value = torch.tensor(
-                    [item[key] for item in batch], dtype=torch.long)
+                    np.array([item[key] for item in batch]), dtype=torch.long) # convert to ndarray first to speed up
             else:
                 value = [item[key] for item in batch]
             batch_dict[key] = value
@@ -58,6 +60,12 @@ def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, 
         # sampler option is mutually exclusive with shuffle
         shuffle = None
 
+    kwargs = dict()
+    # When supported, use 'forkserver' to spawn dataloader workers instead of 'fork' to prevent
+    # issues with Infiniband implementations that are not fork-safe
+    if (is_distributed and num_workers > 0 and hasattr(mp, '_supports_context') and
+            mp._supports_context and 'forkserver' in mp.get_all_start_methods()):
+        kwargs['multiprocessing_context'] = 'forkserver'
     data_loader = DataLoader(
         dataset=dataset,
         sampler=sampler,
@@ -65,7 +73,8 @@ def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, 
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,  # set pin memory to True to enable faster data transfer
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        **kwargs
     )
     return data_loader
 

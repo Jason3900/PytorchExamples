@@ -3,17 +3,13 @@ WANDB_KEY=$WANDB_KEY # paste your key here if wandb is enabled
 TIMESTAMP=$(date +'%Y-%m-%d-%H-%M')
 HOSTFILE="./hostfile"
 LOGDIR="logs"
-NUM_GPUS=4
 TASK_NAME="imdb-cls"
 mkdir -p $LOGDIR
 
-NCCL_ENVS="NCCL_DEBUG=info \
-  NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=0"
-# NCCL_IB_CUDA_SUPPORT=1 NCCL_IB_HCA=mlx5 NCCL_IB_GID_INDEX=3
+NCCL_ENVS="NCCL_DEBUG=info"
 
 OPTIONS="
---horovod \
---adasum \
+--amp \
 --task-name $TASK_NAME \
 --timestamp $TIMESTAMP \
 --label-path config/labelspace_imdb \
@@ -37,7 +33,6 @@ OPTIONS="
 "
 
 RUN_CMD="${NCCL_ENVS} \
-horovodrun -np $NUM_GPUS -hostfile $HOSTFILE --timeline-filename $LOGDIR/timeline-$TIMESTAMP.json \
 python -u run.py \
 $OPTIONS \
 2>&1 | tee ${LOGDIR}/${TASK_NAME}-${TIMESTAMP}.log"
